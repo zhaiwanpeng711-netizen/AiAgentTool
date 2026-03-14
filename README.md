@@ -2,6 +2,8 @@
 
 通过**自然语言指令**并行调度多个 AI 编码 Agent（Cursor IDE、Claude Code CLI、OpenAI Codex CLI、通义千问），提供实时可视化监控面板。
 
+![Dashboard Screenshot](docs/screenshot.png)
+
 ## 目录
 
 - [功能特性](#功能特性)
