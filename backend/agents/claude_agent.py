@@ -5,8 +5,9 @@ import shutil
 from typing import Optional
 
 from backend.agents.base_agent import BaseAgent, LogCallback
-from backend.config import CLAUDE_CLI_PATH, WORKSPACE_DIR, ANTHROPIC_API_KEY, OPENAI_API_KEY
+from backend.config import CLAUDE_CLI_PATH, WORKSPACE_DIR, ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, OPENAI_API_KEY, CLAUDE_MODEL
 from backend.scheduler.models import AgentType, Task
+from backend.scheduler.usage_tracker import usage_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,25 @@ class ClaudeAgent(BaseAgent):
         workspace = task.workspace or WORKSPACE_DIR
         os.makedirs(workspace, exist_ok=True)
 
+        # Check Anthropic API key is configured
+        if not ANTHROPIC_API_KEY:
+            await on_log(
+                "ANTHROPIC_API_KEY is not set.\n"
+                "Get a free API key at: https://console.anthropic.com\n"
+                "Then add it to your .env file: ANTHROPIC_API_KEY=sk-ant-...",
+                "error"
+            )
+            return 1
+
+        # Check claude CLI is available
+        if not shutil.which(CLAUDE_CLI_PATH):
+            await on_log(
+                f"Claude CLI not found at '{CLAUDE_CLI_PATH}'.\n"
+                "Install it with: npm install -g @anthropic-ai/claude-code",
+                "error"
+            )
+            return 1
+
         await on_log(f"Working directory: {workspace}", "system")
         await on_log(f"Invoking: {CLAUDE_CLI_PATH}", "system")
 
@@ -32,13 +52,19 @@ class ClaudeAgent(BaseAgent):
             CLAUDE_CLI_PATH,
             "--print",          # non-interactive, print output
             "--dangerously-skip-permissions",  # skip confirmation prompts
-            task.description,
         ]
+        if CLAUDE_MODEL:
+            cmd += ["--model", CLAUDE_MODEL]
+        cmd.append(task.description)
 
-        # Build environment — explicitly inject API keys
+        # Build environment — inject API keys and optional base URLs
         env = {**os.environ}
         if ANTHROPIC_API_KEY:
             env["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
+        if ANTHROPIC_BASE_URL:
+            # Redirect Claude Code CLI to use the proxy (e.g. Bailian Coding Plan)
+            env["ANTHROPIC_BASE_URL"] = ANTHROPIC_BASE_URL
+            await on_log(f"Using Anthropic proxy: {ANTHROPIC_BASE_URL}", "system")
         if OPENAI_API_KEY:
             env["OPENAI_API_KEY"] = OPENAI_API_KEY
 
@@ -67,7 +93,12 @@ class ClaudeAgent(BaseAgent):
             )
 
             await proc.wait()
-            return proc.returncode or 0
+            rc = proc.returncode or 0
+            usage_tracker.record(
+                agent_type=AgentType.CLAUDE,
+                model=CLAUDE_MODEL or "claude-3-5-sonnet-20241022",
+            )
+            return rc
 
         except FileNotFoundError:
             await on_log(

@@ -5,18 +5,67 @@ import shutil
 from typing import List, Optional
 
 from backend.agents.base_agent import BaseAgent, LogCallback
-from backend.config import CODEX_CLI_PATH, WORKSPACE_DIR, OPENAI_API_KEY, CODEX_MODEL
+from backend.config import (
+    CODEX_CLI_PATH, WORKSPACE_DIR, OPENAI_API_KEY, CODEX_MODEL,
+    CODEX_DEFAULT_PROFILE, CODEX_HOME_PERSONAL, CODEX_HOME_BUSINESS,
+)
 from backend.scheduler.models import AgentType, Task
+from backend.scheduler.usage_tracker import usage_tracker
 
 logger = logging.getLogger(__name__)
 
+# Profile name → CODEX_HOME directory
+PROFILE_HOMES = {
+    "personal": CODEX_HOME_PERSONAL,
+    "business": CODEX_HOME_BUSINESS,
+}
+
+
+def _translate_codex_error(text: str) -> str:
+    """Make common Codex errors more actionable."""
+    t = text.lower()
+    if "usage limit" in t and "try again" in t:
+        return (
+            f"{text}\n"
+            "⚠️  该账号 Codex 配额已用完，等待重置后重试，\n"
+            "   或切换到另一个账号（在 .env 修改 CODEX_DEFAULT_PROFILE）。"
+        )
+    if "model is not supported" in t:
+        return (
+            f"{text}\n"
+            "⚠️  模型不被支持。请在 .env 调整 CODEX_MODEL，\n"
+            "   可选值：gpt-5.2-codex / gpt-5.1-codex-mini / auto"
+        )
+    if "not logged in" in t:
+        return f"{text}\n⚠️  该 profile 未登录，请按说明运行登录命令。"
+    return text
+
+
+def _resolve_auth(profile: str, profile_home: str):
+    """
+    Find the best CODEX_HOME that has a valid auth.json.
+
+    Returns (codex_home_path, description) or (None, None) if no login found.
+
+    Priority:
+      1. Profile-specific home  (e.g. ~/.codex-personal/auth.json)
+      2. Default codex home     (~/.codex/auth.json)
+    """
+    candidates = [
+        (profile_home,                    f"saved login for '{profile}' profile"),
+        (os.path.expanduser("~/.codex"),  "default codex login (~/.codex)"),
+    ]
+    for home, desc in candidates:
+        auth = os.path.join(home, "auth.json")
+        if os.path.isfile(auth):
+            return home, desc
+    return None, None
+
 
 def _resolve_codex_cmd() -> Optional[List[str]]:
-    """Return the command list to invoke codex, or None if unavailable."""
-    # 1. Explicit config path or 'codex' in PATH
+    """Return the codex command list, or None if not found."""
     if shutil.which(CODEX_CLI_PATH):
         return [CODEX_CLI_PATH]
-    # 2. Common manual install locations
     for candidate in [
         os.path.expanduser("~/.local/bin/codex"),
         "/usr/local/bin/codex",
@@ -24,14 +73,54 @@ def _resolve_codex_cmd() -> Optional[List[str]]:
     ]:
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return [candidate]
-    # 3. npx fallback (no global install required)
     if shutil.which("npx"):
         return ["npx", "--yes", "@openai/codex"]
     return None
 
 
+def _get_profile_for_task(task: Task) -> str:
+    """
+    Determine which profile to use for this task.
+    Tasks can specify a profile via description prefix:
+      [personal] do something  →  use personal account
+      [business] do something  →  use business account
+    Otherwise use CODEX_DEFAULT_PROFILE.
+    """
+    desc = task.description.strip()
+    if desc.startswith("[personal]"):
+        return "personal"
+    if desc.startswith("[business]"):
+        return "business"
+    return CODEX_DEFAULT_PROFILE
+
+
+def _strip_profile_prefix(description: str) -> str:
+    """Remove [personal] or [business] prefix from task description."""
+    for prefix in ("[personal]", "[business]"):
+        if description.strip().startswith(prefix):
+            return description.strip()[len(prefix):].strip()
+    return description
+
+
 class CodexAgent(BaseAgent):
-    """Adapter for OpenAI Codex CLI (codex)."""
+    """
+    Adapter for OpenAI Codex CLI with dual-account support.
+
+    Profiles:
+      personal  → CODEX_HOME=~/.codex-personal  (personal ChatGPT account)
+      business  → CODEX_HOME=~/.codex-business  (ChatGPT Business account)
+
+    Setup (run once in your terminal):
+      # Personal account
+      CODEX_HOME=~/.codex-personal codex login
+
+      # Business account
+      CODEX_HOME=~/.codex-business codex login
+
+    Task-level override (prefix your task description):
+      [personal] 用Codex生成排序算法
+      [business] 用Codex重构认证模块
+    """
 
     def __init__(self):
         self._processes: dict[str, asyncio.subprocess.Process] = {}
@@ -47,48 +136,60 @@ class CodexAgent(BaseAgent):
         cmd_prefix: Optional[List[str]] = _resolve_codex_cmd()
         if cmd_prefix is None:
             await on_log(
-                "Codex CLI not found. Install it by running in your terminal:\n"
-                "  npm install -g @openai/codex\n"
-                "Then restart the backend.",
+                "Codex CLI 未找到，请在终端运行：npm install -g @openai/codex",
                 "error"
             )
             return 1
+
+        # Determine profile and codex home
+        profile = _get_profile_for_task(task)
+        codex_home = PROFILE_HOMES.get(profile, CODEX_HOME_PERSONAL)
+        actual_description = _strip_profile_prefix(task.description)
 
         await on_log(f"Working directory: {workspace}", "system")
         await on_log(f"Invoking: {' '.join(cmd_prefix)}", "system")
 
-        # Build environment:
-        # If the user ran `codex login` (ChatGPT Business), do NOT inject OPENAI_API_KEY
-        # so codex uses the stored OAuth credentials (~/.codex/auth.json).
-        # If OPENAI_API_KEY is set AND codex login is NOT present, use the API key.
-        env = {**os.environ}
-        codex_auth_file = os.path.expanduser("~/.codex/auth.json")
-        using_login = os.path.isfile(codex_auth_file)
+        # Resolve which CODEX_HOME to actually use:
+        # Priority: profile-specific home (if auth.json exists) → default ~/.codex → API key
+        #
+        # Strip OPENAI_BASE_URL so Codex CLI does NOT hit the Bailian proxy.
+        # Codex CLI uses the newer /v1/responses endpoint which Bailian doesn't support.
+        # The Python NLP parser uses OPENAI_BASE_URL internally; the CLI should not.
+        env = {k: v for k, v in os.environ.items() if k != "OPENAI_BASE_URL"}
+        resolved_home, auth_source = _resolve_auth(profile, codex_home)
 
-        if using_login:
-            # Remove API key from env so codex falls back to login credentials
+        if resolved_home:
+            env["CODEX_HOME"] = resolved_home
+            await on_log(f"Account profile: {profile} (CODEX_HOME={resolved_home})", "system")
+            await on_log(f"Auth: {auth_source}", "system")
             env.pop("OPENAI_API_KEY", None)
-            await on_log("Using codex login credentials (ChatGPT account)", "system")
         elif OPENAI_API_KEY:
+            # Don't set CODEX_HOME — let codex use its default location
+            env.pop("CODEX_HOME", None)
             env["OPENAI_API_KEY"] = OPENAI_API_KEY
-            await on_log("Using OPENAI_API_KEY for authentication", "system")
+            await on_log(f"Account profile: {profile} — no saved login found, using OPENAI_API_KEY", "system")
         else:
+            default_home = os.path.expanduser("~/.codex")
             await on_log(
-                "No authentication found. Run `codex login` in your terminal "
-                "to log in with your ChatGPT account, or set OPENAI_API_KEY in .env",
+                f"未找到任何登录凭证！\n"
+                f"请在终端运行以下命令登录个人账号：\n"
+                f"  CODEX_HOME={codex_home} codex login\n"
+                f"或登录到默认目录：\n"
+                f"  codex login",
                 "error"
             )
             return 1
 
-        # codex v0.114+ uses subcommand syntax:
-        # codex exec --full-auto --skip-git-repo-check -m gpt-4o "<prompt>"
+        # Build command
+        model_args = [] if CODEX_MODEL.lower() == "auto" else ["-m", CODEX_MODEL]
         cmd = cmd_prefix + [
             "exec",
             "--full-auto",
             "--skip-git-repo-check",
-            "-m", CODEX_MODEL,
-            task.description,
+            *model_args,
+            actual_description,
         ]
+        await on_log(f"Model: {CODEX_MODEL}", "system")
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -107,22 +208,22 @@ class CodexAgent(BaseAgent):
                         break
                     text = line.decode("utf-8", errors="replace").rstrip()
                     if text:
-                        await on_log(text, level)
+                        await on_log(_translate_codex_error(text), level)
 
             await asyncio.gather(
                 stream_reader(proc.stdout, "info"),
                 stream_reader(proc.stderr, "error"),
             )
-
             await proc.wait()
-            return proc.returncode or 0
+            rc = proc.returncode or 0
+            usage_tracker.record(
+                agent_type=AgentType.CODEX,
+                model=CODEX_MODEL,
+            )
+            return rc
 
         except FileNotFoundError:
-            await on_log(
-                "Codex CLI not found. Install it by running in your terminal:\n"
-                "  npm install -g @openai/codex",
-                "error"
-            )
+            await on_log("Codex CLI 未找到，请运行：npm install -g @openai/codex", "error")
             return 1
         finally:
             self._processes.pop(task.id, None)

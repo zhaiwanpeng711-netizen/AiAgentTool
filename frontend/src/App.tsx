@@ -1,10 +1,11 @@
 import { useState, useCallback, useEffect, useRef } from 'react'
-import { TaskSummary, TaskDetail, AgentInfo, AgentType, LogEntry, ParsedTask, WsEvent } from './types'
+import { TaskSummary, TaskDetail, AgentInfo, AgentType, AgentUsage, LogEntry, ParsedTask, WsEvent } from './types'
 import { useWebSocket } from './hooks/useWebSocket'
 import { AgentCard } from './components/AgentCard'
 import { TaskCreator } from './components/TaskCreator'
 import { TaskList } from './components/TaskList'
 import { LogViewer } from './components/LogViewer'
+import { UsagePanel } from './components/UsagePanel'
 import clsx from 'clsx'
 
 const API = '/api'
@@ -17,6 +18,8 @@ export default function App() {
   const [liveLog, setLiveLog] = useState<LogEntry[]>([])
   const [activeTab, setActiveTab] = useState<'dashboard' | 'tasks'>('dashboard')
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null)
+  const [usage, setUsage] = useState<AgentUsage[]>([])
+  const [totalCostUsd, setTotalCostUsd] = useState(0)
   const liveLogRef = useRef<Map<string, LogEntry[]>>(new Map())
 
   const showToast = (message: string, type: 'success' | 'error' = 'success') => {
@@ -71,18 +74,39 @@ export default function App() {
           return next
         })
         break
+
+      case 'usage_updated': {
+        const list = event.data as AgentUsage[]
+        setUsage(list)
+        setTotalCostUsd(list.reduce((s, u) => s + u.cost_usd, 0))
+        break
+      }
+
+      case 'state_reset':
+        // Backend restarted (hot-reload) — clear stale frontend state
+        // Fresh task_snapshot events will repopulate the list
+        setTasks(new Map())
+        setTaskDetail(null)
+        setSelectedTaskId(null)
+        setLiveLog([])
+        liveLogRef.current.clear()
+        break
     }
   }, [selectedTaskId])
 
   const { connected } = useWebSocket(handleWsMessage)
 
-  // Load initial data
+  // Load initial data (REST fallback; WS snapshot also restores state on reconnect)
   useEffect(() => {
     fetch(`${API}/tasks`).then(r => r.json()).then(d => {
       setTasks(new Map(d.tasks.map((t: TaskSummary) => [t.id, t])))
     }).catch(() => {})
     fetch(`${API}/agents`).then(r => r.json()).then(d => {
       setAgents(new Map(d.agents.map((a: AgentInfo) => [a.agent_type, a])))
+    }).catch(() => {})
+    fetch(`${API}/usage`).then(r => r.json()).then(d => {
+      setUsage(d.usage ?? [])
+      setTotalCostUsd(d.total_cost_usd ?? 0)
     }).catch(() => {})
   }, [])
 
@@ -94,17 +118,42 @@ export default function App() {
       return
     }
     fetch(`${API}/tasks/${selectedTaskId}`)
-      .then(r => r.json())
-      .then(d => {
+      .then(async r => {
+        if (!r.ok) {
+          // Task not found — likely backend restarted and cleared memory
+          const detail: TaskDetail = {
+            id: selectedTaskId,
+            description: tasks.get(selectedTaskId)?.description ?? '(任务已丢失)',
+            agent_type: tasks.get(selectedTaskId)?.agent_type ?? 'qwen',
+            status: 'failed',
+            created_at: '',
+            started_at: null,
+            completed_at: null,
+            exit_code: null,
+            log_count: 0,
+            logs: [{
+              timestamp: new Date().toISOString(),
+              level: 'error',
+              message: `后端已重启，历史任务记录丢失。\n请重新提交任务后查看日志。`,
+            }],
+          }
+          setTaskDetail(detail)
+          setLiveLog([])
+          return
+        }
+        const d = await r.json()
         setTaskDetail(d)
-        // Merge with any buffered live logs
+        // Merge with any buffered live logs (de-duplicate)
         const buffered = liveLogRef.current.get(selectedTaskId) ?? []
-        const existing = new Set(d.logs.map((l: LogEntry) => `${l.timestamp}${l.message}`))
+        const storedLogs: LogEntry[] = Array.isArray(d.logs) ? d.logs : []
+        const existing = new Set(storedLogs.map((l: LogEntry) => `${l.timestamp}${l.message}`))
         const newLogs = buffered.filter(l => !existing.has(`${l.timestamp}${l.message}`))
         setLiveLog(newLogs)
       })
-      .catch(() => setTaskDetail(null))
-  }, [selectedTaskId])
+      .catch(() => {
+        setTaskDetail(null)
+      })
+  }, [selectedTaskId, tasks])
 
   const handleSelectTask = (id: string) => {
     setSelectedTaskId(id)
@@ -227,7 +276,7 @@ export default function App() {
             <div className="space-y-6 animate-[fadeIn_0.2s_ease-out]">
               {/* Agent overview grid */}
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                {(['cursor', 'claude', 'codex'] as AgentType[]).map(agentType => {
+                {(['cursor', 'claude', 'codex', 'qwen'] as AgentType[]).map(agentType => {
                   const info = agents.get(agentType) ?? {
                     agent_type: agentType,
                     running_tasks: 0,
@@ -248,13 +297,20 @@ export default function App() {
                 })}
               </div>
 
-              {/* Summary stats */}
-              <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-                <SummaryCard label="全部任务" value={taskList.length} color="text-slate-300" />
-                <SummaryCard label="运行中" value={taskList.filter(t => t.status === 'running').length} color="text-yellow-400" />
-                <SummaryCard label="已完成" value={taskList.filter(t => t.status === 'completed').length} color="text-emerald-400" />
-                <SummaryCard label="失败" value={taskList.filter(t => t.status === 'failed').length} color="text-red-400" />
-                <SummaryCard label="已停止" value={taskList.filter(t => t.status === 'stopped').length} color="text-orange-400" />
+              {/* Summary stats + Usage panel */}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                {/* Task stats */}
+                <div className="md:col-span-2 grid grid-cols-2 sm:grid-cols-5 gap-3 content-start">
+                  <SummaryCard label="全部任务" value={taskList.length} color="text-slate-300" />
+                  <SummaryCard label="运行中" value={taskList.filter(t => t.status === 'running').length} color="text-yellow-400" />
+                  <SummaryCard label="已完成" value={taskList.filter(t => t.status === 'completed').length} color="text-emerald-400" />
+                  <SummaryCard label="失败" value={taskList.filter(t => t.status === 'failed').length} color="text-red-400" />
+                  <SummaryCard label="已停止" value={taskList.filter(t => t.status === 'stopped').length} color="text-orange-400" />
+                </div>
+                {/* Usage & cost */}
+                <div>
+                  <UsagePanel usage={usage} totalCostUsd={totalCostUsd} />
+                </div>
               </div>
             </div>
           )}

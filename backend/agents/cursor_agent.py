@@ -2,8 +2,8 @@ import asyncio
 import logging
 import platform
 import subprocess
-import tempfile
 import os
+from pathlib import Path
 
 from backend.agents.base_agent import BaseAgent, LogCallback
 from backend.config import CURSOR_APP_NAME, WORKSPACE_DIR
@@ -13,12 +13,65 @@ logger = logging.getLogger(__name__)
 
 SYSTEM = platform.system()  # "Darwin" or "Linux"
 
+# Directories / extensions to ignore when watching for file changes
+_IGNORE_DIRS = {'.git', 'node_modules', '__pycache__', '.venv', 'venv',
+                'dist', 'build', '.next', '.nuxt', '.cache'}
+_IGNORE_EXT  = {'.pyc', '.pyo', '.log', '.DS_Store'}
+# Max bytes to preview per file in the result summary
+_PREVIEW_BYTES = 2000
+
+_LANG_MAP = {
+    '.py': 'python', '.js': 'javascript', '.ts': 'typescript',
+    '.tsx': 'tsx', '.jsx': 'jsx', '.html': 'html', '.css': 'css',
+    '.json': 'json', '.yaml': 'yaml', '.yml': 'yaml', '.sh': 'bash',
+    '.md': 'markdown', '.go': 'go', '.rs': 'rust', '.java': 'java',
+    '.cpp': 'cpp', '.c': 'c', '.sql': 'sql', '.toml': 'toml',
+}
+
+def _guess_lang(filename: str) -> str:
+    return _LANG_MAP.get(Path(filename).suffix.lower(), '')
+
+
+def _workspace_snapshot(workspace: str) -> dict[str, float]:
+    """Return {rel_path: mtime} for all tracked files in workspace."""
+    snap = {}
+    base = Path(workspace)
+    for root, dirs, files in os.walk(workspace):
+        dirs[:] = [d for d in dirs if d not in _IGNORE_DIRS and not d.startswith('.')]
+        for f in files:
+            if any(f.endswith(ext) for ext in _IGNORE_EXT):
+                continue
+            full = Path(root) / f
+            try:
+                snap[str(full.relative_to(base))] = full.stat().st_mtime
+            except (OSError, ValueError):
+                pass
+    return snap
+
+
+def _workspace_diff(before: dict[str, float], workspace: str) -> dict:
+    """Diff current workspace against before snapshot."""
+    after = _workspace_snapshot(workspace)
+    added    = sorted(p for p in after if p not in before)
+    modified = sorted(p for p in after if p in before and after[p] != before[p])
+    deleted  = sorted(p for p in before if p not in after)
+    return {"added": added, "modified": modified, "deleted": deleted, "after": after}
+
 
 class CursorAgent(BaseAgent):
     """
-    Adapter for Cursor IDE via GUI automation.
-    - macOS: AppleScript to activate window, open Agent panel, type prompt
-    - Linux: xdotool to perform the same operations
+    Cursor IDE Agent via GUI automation.
+
+    macOS flow:
+      1. pbcopy → set clipboard safely (handles all special chars)
+      2. open -a Cursor <workspace>  →  open/focus workspace
+      3. AppleScript: Cmd+L  →  open/focus Chat panel
+      4. AppleScript: Cmd+A + Delete  →  clear input
+      5. AppleScript: Cmd+V  →  paste task
+      6. AppleScript: Return  →  submit
+      7. Poll window state for completion
+
+    Linux flow: xdotool equivalent steps
     """
 
     def __init__(self):
@@ -33,7 +86,6 @@ class CursorAgent(BaseAgent):
         workspace = task.workspace or WORKSPACE_DIR
         os.makedirs(workspace, exist_ok=True)
 
-        await on_log(f"Preparing Cursor agent for task...", "system")
         await on_log(f"Workspace: {workspace}", "system")
 
         try:
@@ -48,224 +100,392 @@ class CursorAgent(BaseAgent):
             self._stop_flags.pop(task.id, None)
 
     # ------------------------------------------------------------------
-    # macOS via AppleScript
+    # macOS
     # ------------------------------------------------------------------
 
     async def _run_macos(self, task: Task, workspace: str, on_log: LogCallback) -> int:
-        await on_log("Activating Cursor (macOS)...", "system")
+        # ── Step 0: snapshot workspace before submission ───────────────
+        before_snap = _workspace_snapshot(workspace)
+        await on_log(f"Workspace snapshot: {len(before_snap)} existing files tracked.", "system")
 
-        # 1. Open workspace in Cursor
-        open_result = await self._run_shell(
-            ["open", "-a", CURSOR_APP_NAME, workspace],
-            on_log
-        )
-        if open_result != 0:
-            await on_log(f"Failed to open Cursor with workspace: {workspace}", "error")
+        # ── Step 1: set clipboard via pbcopy (safe for any text) ──────
+        await on_log("Setting clipboard content...", "system")
+        try:
+            pbcopy = await asyncio.create_subprocess_exec(
+                "pbcopy",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await pbcopy.communicate(input=task.description.encode("utf-8"))
+        except Exception as e:
+            await on_log(f"pbcopy failed: {e}", "error")
+            return 1
 
-        await asyncio.sleep(2.0)  # Wait for Cursor to focus
+        # ── Step 2: open workspace in Cursor ──────────────────────────
+        await on_log("Opening workspace in Cursor...", "system")
+        ret = await self._shell(["open", "-a", CURSOR_APP_NAME, workspace])
+        if ret != 0:
+            # Fallback: try 'cursor' CLI
+            ret = await self._shell(["cursor", workspace])
+        if ret != 0:
+            await on_log("Failed to open Cursor. Make sure Cursor is installed.", "error")
+            return 1
+
+        # Wait for Cursor to load the workspace
+        await on_log("Waiting for Cursor to load...", "system")
+        await asyncio.sleep(3.0)
 
         if self._stop_flags.get(task.id):
             return 0
 
-        # 2. Open Agent/Composer panel (Cmd+I)
-        applescript_open_panel = f'''
+        # ── Step 3: activate + open Chat panel with Cmd+L ────────────
+        await on_log("Opening Cursor Chat panel (Cmd+L)...", "system")
+        script_open_chat = f'''
 tell application "{CURSOR_APP_NAME}"
     activate
 end tell
-delay 0.5
-tell application "System Events"
-    keystroke "i" using command down
-end tell
 delay 1.0
+tell application "System Events"
+    tell process "{CURSOR_APP_NAME}"
+        -- Cmd+L opens/focuses the AI chat sidebar
+        keystroke "l" using command down
+    end tell
+end tell
+delay 1.5
 '''
-        await self._run_applescript(applescript_open_panel, on_log)
+        rc = await self._applescript(script_open_chat, on_log)
+        if rc != 0:
+            await on_log("Could not open Cursor chat panel via AppleScript. "
+                         "Check: System Preferences → Privacy → Accessibility (grant terminal access).",
+                         "error")
+            return 1
 
         if self._stop_flags.get(task.id):
             return 0
 
-        # 3. Type the task into the input field and submit
-        safe_task = task.description.replace('"', '\\"').replace("'", "\\'")
-        applescript_type = f'''
+        # ── Step 4 & 5: clear input field + paste task ────────────────
+        await on_log("Pasting task into Cursor Agent input...", "system")
+        script_paste = f'''
 tell application "System Events"
-    -- Clear any existing content and type the task
-    key code 0 using command down
-    delay 0.2
-    set the clipboard to "{safe_task}"
-    keystroke "v" using command down
-    delay 0.5
-    key code 36
+    tell process "{CURSOR_APP_NAME}"
+        -- Select all existing text in the input and delete it
+        keystroke "a" using command down
+        delay 0.2
+        key code 51
+        delay 0.2
+        -- Paste the task from clipboard
+        keystroke "v" using command down
+        delay 0.5
+    end tell
 end tell
 '''
-        await self._run_applescript(applescript_type, on_log)
-        await on_log("Task submitted to Cursor Agent. Monitoring for completion...", "system")
+        await self._applescript(script_paste, on_log)
 
-        # 4. Monitor for completion by polling Cursor window title / accessibility
-        return await self._monitor_cursor_macos(task, on_log)
+        if self._stop_flags.get(task.id):
+            return 0
 
-    async def _monitor_cursor_macos(self, task: Task, on_log: LogCallback) -> int:
-        """Poll every 5 seconds for task completion signals."""
-        max_wait = 3600  # 1 hour timeout
+        # ── Step 6: submit with Return ────────────────────────────────
+        await on_log("Submitting task to Cursor Agent...", "system")
+        script_submit = f'''
+tell application "System Events"
+    tell process "{CURSOR_APP_NAME}"
+        key code 36
+    end tell
+end tell
+'''
+        await self._applescript(script_submit, on_log)
+        await on_log("✓ Task submitted to Cursor Agent chat.", "system")
+        await on_log(
+            "Cursor Agent is now working on the task.\n"
+            "Watch progress in the Cursor window.\n"
+            "Click [Stop] in this panel when Cursor finishes — results will appear here.",
+            "system"
+        )
+
+        # ── Step 7: monitor + capture file results ────────────────────
+        rc = await self._monitor_macos(task, workspace, before_snap, on_log)
+        await self._report_results(workspace, before_snap, on_log)
+        return rc
+
+    async def _monitor_macos(
+        self, task: Task, workspace: str, before_snap: dict, on_log: LogCallback
+    ) -> int:
+        """
+        Poll Cursor window + workspace every 10s.
+        Reports file changes in real-time; user clicks Stop when satisfied.
+        Auto-completes after 1h timeout.
+        """
+        max_wait = 3600
         elapsed = 0
-        check_interval = 5
+        interval = 10
+        last_title = ""
+        reported_files: set[str] = set()
 
         while elapsed < max_wait:
             if self._stop_flags.get(task.id):
                 await on_log("Cursor task stopped by user.", "system")
                 return 0
 
-            # Check if Cursor is still processing (look for "Working..." in title or UI)
+            # ── Check window title ────────────────────────────────────
             script = f'''
-tell application "System Events"
-    tell process "{CURSOR_APP_NAME}"
-        set frontWindow to front window
-        set wTitle to title of frontWindow
-        return wTitle
+try
+    tell application "System Events"
+        tell process "{CURSOR_APP_NAME}"
+            return title of front window
+        end tell
     end tell
-end tell
+on error
+    return ""
+end try
 '''
-            result = await self._run_applescript_capture(script)
-            if result:
-                await on_log(f"[Cursor] Window: {result.strip()}", "info")
+            title = await self._applescript_capture(script)
+            if title and title != last_title:
+                await on_log(f"[Cursor] {title}", "info")
+                last_title = title
 
-            await asyncio.sleep(check_interval)
-            elapsed += check_interval
+            # ── Report newly created/modified files ───────────────────
+            diff = _workspace_diff(before_snap, workspace)
+            new_files = [f for f in (diff["added"] + diff["modified"]) if f not in reported_files]
+            for rel in new_files:
+                reported_files.add(rel)
+                action = "新增" if rel in diff["added"] else "修改"
+                await on_log(f"[文件{action}] {rel}", "info")
 
-            # Heuristic: if window title no longer shows "Generating" or "Working"
-            if result and not any(kw in result.lower() for kw in ["generating", "working", "running"]):
-                if elapsed > 10:  # Give it at least 10 seconds
-                    await on_log("Cursor Agent appears to have completed the task.", "system")
+            # ── Heuristic: auto-complete if Cursor goes to background ──
+            is_busy = any(kw in title.lower() for kw in
+                          ["generating", "working", "running", "thinking", "loading"])
+            if not is_busy and elapsed >= 30:
+                front_app = await self._applescript_capture(
+                    'tell application "System Events" to return name of first process whose frontmost is true'
+                )
+                if front_app and CURSOR_APP_NAME.lower() not in front_app.lower():
+                    await on_log("Cursor 已切到后台 — 任务标记为完成。", "system")
                     return 0
 
-        await on_log("Cursor task monitoring timed out.", "error")
-        return 1
+            await asyncio.sleep(interval)
+            elapsed += interval
+
+        await on_log("Cursor task monitoring timed out (1 hour). Marking complete.", "system")
+        return 0
 
     # ------------------------------------------------------------------
     # Linux via xdotool
     # ------------------------------------------------------------------
 
     async def _run_linux(self, task: Task, workspace: str, on_log: LogCallback) -> int:
+        before_snap = _workspace_snapshot(workspace)
+        await on_log(f"Workspace snapshot: {len(before_snap)} existing files tracked.", "system")
         await on_log("Activating Cursor (Linux/xdotool)...", "system")
 
-        # Check xdotool is available
-        check = await self._run_shell(["which", "xdotool"], on_log, capture=True)
-        if check != 0:
+        import shutil
+        if not shutil.which("xdotool"):
             await on_log("xdotool not found. Install: sudo apt install xdotool", "error")
             return 1
 
-        # Open workspace in cursor
-        await self._run_shell(["cursor", workspace], on_log)
+        # Open workspace
+        await self._shell(["cursor", workspace])
         await asyncio.sleep(3.0)
 
         if self._stop_flags.get(task.id):
             return 0
 
-        # Find Cursor window ID
-        win_id_result = subprocess.run(
+        # Find Cursor window
+        result = subprocess.run(
             ["xdotool", "search", "--name", "Cursor"],
             capture_output=True, text=True
         )
-        win_ids = win_id_result.stdout.strip().split("\n")
-        if not win_ids or not win_ids[0]:
-            await on_log("Could not find Cursor window via xdotool", "error")
+        win_ids = [w for w in result.stdout.strip().split("\n") if w]
+        if not win_ids:
+            await on_log("Could not find Cursor window via xdotool.", "error")
             return 1
+        win_id = win_ids[-1]
+        await on_log(f"Found Cursor window: {win_id}", "system")
 
-        win_id = win_ids[-1]  # Use last (most recent)
-        await on_log(f"Found Cursor window ID: {win_id}", "system")
-
-        # Focus window and open Agent panel (Ctrl+I on Linux)
-        await self._run_shell(["xdotool", "windowactivate", "--sync", win_id], on_log)
+        # Focus + open Chat (Ctrl+L on Linux)
+        subprocess.run(["xdotool", "windowactivate", "--sync", win_id])
         await asyncio.sleep(0.5)
-        await self._run_shell(["xdotool", "key", "--window", win_id, "ctrl+i"], on_log)
-        await asyncio.sleep(1.0)
+        subprocess.run(["xdotool", "key", "--window", win_id, "ctrl+l"])
+        await asyncio.sleep(1.5)
 
         if self._stop_flags.get(task.id):
             return 0
 
-        # Type the task
-        safe_task = task.description.replace("'", "'\\''")
-        await self._run_shell(
-            ["xdotool", "type", "--window", win_id, "--clearmodifiers", "--delay", "30", task.description],
-            on_log
+        # Set clipboard using xclip/xsel
+        import shutil as _sh
+        clip_cmd = None
+        if _sh.which("xclip"):
+            clip_cmd = ["xclip", "-selection", "clipboard"]
+        elif _sh.which("xsel"):
+            clip_cmd = ["xsel", "--clipboard", "--input"]
+        if clip_cmd:
+            p = subprocess.Popen(clip_cmd, stdin=subprocess.PIPE)
+            p.communicate(input=task.description.encode("utf-8"))
+        else:
+            await on_log("xclip/xsel not found, using xdotool type (may be slow).", "system")
+
+        # Clear + paste
+        subprocess.run(["xdotool", "key", "--window", win_id, "ctrl+a"])
+        await asyncio.sleep(0.2)
+        if clip_cmd:
+            subprocess.run(["xdotool", "key", "--window", win_id, "ctrl+v"])
+        else:
+            subprocess.run([
+                "xdotool", "type", "--window", win_id,
+                "--clearmodifiers", "--delay", "20", task.description
+            ])
+        await asyncio.sleep(0.5)
+
+        # Submit
+        subprocess.run(["xdotool", "key", "--window", win_id, "Return"])
+        await on_log("✓ Task submitted to Cursor Agent (Linux).", "system")
+        await on_log(
+            "Watch progress in the Cursor window.\nClick [Stop] when Cursor finishes — results will appear here.",
+            "system"
         )
-        await asyncio.sleep(0.3)
-        await self._run_shell(["xdotool", "key", "--window", win_id, "Return"], on_log)
 
-        await on_log("Task submitted to Cursor Agent (Linux). Monitoring for completion...", "system")
-        return await self._monitor_cursor_linux(task, win_id, on_log)
+        rc = await self._monitor_linux(task, win_id, workspace, before_snap, on_log)
+        await self._report_results(workspace, before_snap, on_log)
+        return rc
 
-    async def _monitor_cursor_linux(self, task: Task, win_id: str, on_log: LogCallback) -> int:
+    async def _monitor_linux(
+        self, task: Task, win_id: str, workspace: str, before_snap: dict, on_log: LogCallback
+    ) -> int:
         max_wait = 3600
         elapsed = 0
-        check_interval = 5
+        interval = 10
+        last_title = ""
+        reported_files: set[str] = set()
 
         while elapsed < max_wait:
             if self._stop_flags.get(task.id):
                 return 0
 
-            result = subprocess.run(
-                ["xdotool", "getwindowname", win_id],
-                capture_output=True, text=True
-            )
-            title = result.stdout.strip()
-            if title:
-                await on_log(f"[Cursor] Window: {title}", "info")
+            r = subprocess.run(["xdotool", "getwindowname", win_id],
+                               capture_output=True, text=True)
+            title = r.stdout.strip()
+            if title and title != last_title:
+                await on_log(f"[Cursor] {title}", "info")
+                last_title = title
 
-            await asyncio.sleep(check_interval)
-            elapsed += check_interval
+            # Report newly created/modified files
+            diff = _workspace_diff(before_snap, workspace)
+            new_files = [f for f in (diff["added"] + diff["modified"]) if f not in reported_files]
+            for rel in new_files:
+                reported_files.add(rel)
+                action = "新增" if rel in diff["added"] else "修改"
+                await on_log(f"[文件{action}] {rel}", "info")
 
-            if elapsed > 10 and not any(kw in title.lower() for kw in ["generating", "working", "running"]):
-                await on_log("Cursor Agent appears to have completed the task.", "system")
+            is_busy = any(kw in title.lower() for kw in
+                          ["generating", "working", "running", "thinking"])
+            if not is_busy and elapsed >= 30:
+                await on_log("Cursor appears idle — marking task as completed.", "system")
                 return 0
 
-        await on_log("Cursor task monitoring timed out.", "error")
-        return 1
+            await asyncio.sleep(interval)
+            elapsed += interval
+
+        return 0
+
+    # ------------------------------------------------------------------
+    # Results reporting
+    # ------------------------------------------------------------------
+
+    async def _report_results(
+        self, workspace: str, before_snap: dict, on_log: LogCallback
+    ) -> None:
+        """
+        After Cursor finishes, diff the workspace and log:
+        - list of added / modified / deleted files
+        - content preview for each changed file (up to _PREVIEW_BYTES)
+        """
+        diff = _workspace_diff(before_snap, workspace)
+        added    = diff["added"]
+        modified = diff["modified"]
+        deleted  = diff["deleted"]
+
+        if not added and not modified and not deleted:
+            await on_log(
+                "\n📂 工作区无文件变化。\n"
+                "Cursor 可能将结果直接回复在对话中，请在 Cursor 窗口查看。",
+                "system"
+            )
+            return
+
+        lines = [f"\n{'─'*48}", "📋 Cursor 执行结果摘要", f"{'─'*48}"]
+        if added:
+            lines.append(f"\n✅ 新增文件 ({len(added)} 个):")
+            for rel in added:
+                lines.append(f"  + {rel}")
+        if modified:
+            lines.append(f"\n✏️  修改文件 ({len(modified)} 个):")
+            for rel in modified:
+                lines.append(f"  ~ {rel}")
+        if deleted:
+            lines.append(f"\n🗑️  删除文件 ({len(deleted)} 个):")
+            for rel in deleted:
+                lines.append(f"  - {rel}")
+
+        await on_log("\n".join(lines), "system")
+
+        # ── Per-file content preview ───────────────────────────────────
+        preview_targets = added + modified
+        for rel in preview_targets:
+            full = Path(workspace) / rel
+            try:
+                raw = full.read_bytes()
+                # Skip binary files
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    await on_log(f"\n[{rel}] (二进制文件，跳过预览)", "system")
+                    continue
+
+                size = len(text)
+                preview = text[:_PREVIEW_BYTES]
+                truncated = size > _PREVIEW_BYTES
+                lang = _guess_lang(rel)
+                header = f"\n📄 {rel}  ({size} 字节{', 已截断' if truncated else ''})"
+                body = f"```{lang}\n{preview}{'...' if truncated else ''}\n```"
+                await on_log(header + "\n" + body, "info")
+            except Exception as e:
+                await on_log(f"\n[{rel}] 读取失败: {e}", "error")
+
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    async def _run_shell(self, cmd: list, on_log: LogCallback, capture: bool = False) -> int:
+    async def _shell(self, cmd: list) -> int:
         try:
-            if capture:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-            else:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-            _, stderr = await proc.communicate()
-            if stderr:
-                decoded = stderr.decode("utf-8", errors="replace").strip()
-                if decoded:
-                    await on_log(decoded, "error")
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
             return proc.returncode or 0
-        except Exception as e:
-            await on_log(f"Shell error: {e}", "error")
+        except Exception:
             return 1
 
-    async def _run_applescript(self, script: str, on_log: LogCallback) -> int:
+    async def _applescript(self, script: str, on_log: LogCallback) -> int:
         try:
             proc = await asyncio.create_subprocess_exec(
                 "osascript", "-e", script,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await proc.communicate()
+            _, stderr = await proc.communicate()
             if stderr:
-                decoded = stderr.decode("utf-8", errors="replace").strip()
-                if decoded:
-                    await on_log(f"AppleScript: {decoded}", "error")
+                msg = stderr.decode("utf-8", errors="replace").strip()
+                if msg:
+                    await on_log(f"AppleScript: {msg}", "error")
             return proc.returncode or 0
         except Exception as e:
             await on_log(f"AppleScript error: {e}", "error")
             return 1
 
-    async def _run_applescript_capture(self, script: str) -> str:
+    async def _applescript_capture(self, script: str) -> str:
         try:
             proc = await asyncio.create_subprocess_exec(
                 "osascript", "-e", script,

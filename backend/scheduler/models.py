@@ -9,6 +9,7 @@ class AgentType(str, Enum):
     CURSOR = "cursor"
     CLAUDE = "claude"
     CODEX = "codex"
+    QWEN = "qwen"
 
 
 class TaskStatus(str, Enum):

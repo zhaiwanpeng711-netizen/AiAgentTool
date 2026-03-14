@@ -10,10 +10,12 @@ import pathlib
 
 from backend.config import HOST, PORT
 from backend.scheduler.task_manager import task_manager
+from backend.scheduler.usage_tracker import usage_tracker
 from backend.scheduler.models import AgentType
 from backend.agents.claude_agent import ClaudeAgent
 from backend.agents.codex_agent import CodexAgent
 from backend.agents.cursor_agent import CursorAgent
+from backend.agents.qwen_agent import QwenAgent
 from backend.api.ws_handler import manager
 from backend.api.routes import router
 
@@ -31,11 +33,13 @@ async def lifespan(app: FastAPI):
     task_manager.register_agent(AgentType.CLAUDE, ClaudeAgent())
     task_manager.register_agent(AgentType.CODEX, CodexAgent())
     task_manager.register_agent(AgentType.CURSOR, CursorAgent())
+    task_manager.register_agent(AgentType.QWEN, QwenAgent())
 
-    # Wire up WebSocket broadcast to task manager
+    # Wire up WebSocket broadcast to task manager and usage tracker
     task_manager.set_broadcast_callback(manager.broadcast)
+    usage_tracker.set_broadcast_callback(manager.broadcast)
 
-    logger.info("AI Agent Scheduler started. Agents registered: claude, codex, cursor")
+    logger.info("AI Agent Scheduler started. Agents registered: claude, codex, cursor, qwen")
     yield
     logger.info("Shutting down AI Agent Scheduler...")
 

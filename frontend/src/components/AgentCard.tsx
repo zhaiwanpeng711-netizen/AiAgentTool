@@ -20,6 +20,12 @@ const AGENT_META: Record<AgentType, { label: string; color: string; glowClass: s
     glowClass: 'glow-green',
     icon: '◇',
   },
+  qwen: {
+    label: '通义千问',
+    color: 'text-[#f59e0b]',
+    glowClass: 'glow-amber',
+    icon: '✦',
+  },
 }
 
 interface Props {

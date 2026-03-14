@@ -6,12 +6,14 @@ const AGENT_COLORS: Record<AgentType, string> = {
   cursor: 'text-[#4f9eff] bg-[#4f9eff]/10 border-[#4f9eff]/30',
   claude: 'text-[#a855f7] bg-[#a855f7]/10 border-[#a855f7]/30',
   codex:  'text-[#22d3a0] bg-[#22d3a0]/10 border-[#22d3a0]/30',
+  qwen:   'text-[#f59e0b] bg-[#f59e0b]/10 border-[#f59e0b]/30',
 }
 
 const AGENT_ICONS: Record<AgentType, string> = {
   cursor: '⬡',
   claude: '◈',
   codex:  '◇',
+  qwen:   '✦',
 }
 
 const EXAMPLE_PROMPTS = [

@@ -7,6 +7,7 @@ from backend.scheduler.models import (
     CreateTaskRequest, AgentType, TaskStatus, ParsedTask
 )
 from backend.scheduler.task_manager import task_manager
+from backend.scheduler.usage_tracker import usage_tracker
 from backend.nlp.parser import parse_natural_language
 from backend.api.ws_handler import manager
 
@@ -22,14 +23,27 @@ router = APIRouter()
 async def websocket_endpoint(ws: WebSocket):
     await manager.connect(ws)
     try:
-        # Send current state on connect
-        tasks = task_manager.list_tasks()
-        for task in tasks:
+        # Signal frontend to clear stale state before receiving fresh snapshots.
+        # This handles backend reloads (uvicorn hot-reload) that wipe in-memory tasks.
+        current_tasks = task_manager.list_tasks()
+        await manager.send_personal(ws, {
+            "event": "state_reset",
+            "data": {"task_count": len(current_tasks)}
+        })
+
+        # Send current state on connect (survives browser refresh)
+        for task in current_tasks:
             await manager.send_personal(ws, {"event": "task_snapshot", "data": task.to_summary()})
 
         agents = task_manager.get_agent_info()
         for agent in agents:
             await manager.send_personal(ws, {"event": "agent_info", "data": agent.dict()})
+
+        # Send usage stats snapshot
+        await manager.send_personal(ws, {
+            "event": "usage_updated",
+            "data": usage_tracker.get_stats(),
+        })
 
         # Keep connection alive, handle pings
         while True:
@@ -151,6 +165,19 @@ async def delete_task(task_id: str):
 async def get_agents():
     agents = task_manager.get_agent_info()
     return {"agents": [a.dict() for a in agents]}
+
+
+# ------------------------------------------------------------------
+# Usage & Cost Statistics
+# ------------------------------------------------------------------
+
+@router.get("/api/usage")
+async def get_usage():
+    """Return per-agent token usage and estimated cost (in-memory, resets on server restart)."""
+    return {
+        "usage": usage_tracker.get_stats(),
+        "total_cost_usd": usage_tracker.get_total_cost(),
+    }
 
 
 # ------------------------------------------------------------------

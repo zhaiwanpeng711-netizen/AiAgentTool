@@ -5,7 +5,8 @@ from typing import Optional
 
 from backend.config import (
     LLM_PROVIDER, LLM_MODEL,
-    ANTHROPIC_API_KEY, OPENAI_API_KEY
+    ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL,
+    OPENAI_API_KEY, OPENAI_BASE_URL,
 )
 from backend.scheduler.models import AgentType, ParsedTask
 
@@ -18,20 +19,22 @@ Available agents:
 - "cursor": Cursor IDE agent — best for interactive coding, UI development, file editing with visual context
 - "claude": Claude Code CLI — best for coding, refactoring, writing tests, backend logic, documentation
 - "codex": OpenAI Codex CLI — best for code generation, completion, algorithmic problems
+- "qwen": Qwen (通义千问) API — best when the user explicitly mentions 千问/通义/Qwen, or for any general coding and reasoning tasks
 
 Return a JSON array only (no markdown, no explanation). Each item must have:
-- "agent": one of "cursor", "claude", "codex"  
+- "agent": one of "cursor", "claude", "codex", "qwen"
 - "task": clear, specific description of what to do (in the same language as the user's input)
 
 If the user doesn't specify an agent, pick the most suitable one.
+If the user mentions 千问、通义、通义千问 or Qwen, always assign agent "qwen".
 If the user specifies multiple tasks, split them into separate items.
-If the task is ambiguous, assign it to "claude" as default.
+If the task is ambiguous, assign it to "qwen" as default.
 
-Example input: "用Cursor实现登录页面，同时用Claude Code写单元测试"
+Example input: "用Cursor实现登录页面，同时用千问写单元测试"
 Example output:
 [
   {"agent": "cursor", "task": "实现用户登录页面，包括登录表单、验证和样式"},
-  {"agent": "claude", "task": "为登录模块编写完整的单元测试"}
+  {"agent": "qwen", "task": "为登录模块编写完整的单元测试"}
 ]"""
 
 
@@ -52,7 +55,10 @@ async def parse_natural_language(text: str, workspace: Optional[str] = None) -> 
 
 async def _parse_with_anthropic(text: str, workspace: Optional[str]) -> list[ParsedTask]:
     import anthropic
-    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    kwargs = {"api_key": ANTHROPIC_API_KEY}
+    if ANTHROPIC_BASE_URL:
+        kwargs["base_url"] = ANTHROPIC_BASE_URL
+    client = anthropic.AsyncAnthropic(**kwargs)
 
     message = await client.messages.create(
         model=LLM_MODEL,
@@ -66,10 +72,13 @@ async def _parse_with_anthropic(text: str, workspace: Optional[str]) -> list[Par
 
 async def _parse_with_openai(text: str, workspace: Optional[str]) -> list[ParsedTask]:
     from openai import AsyncOpenAI
-    client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    kwargs = {"api_key": OPENAI_API_KEY}
+    if OPENAI_BASE_URL:
+        kwargs["base_url"] = OPENAI_BASE_URL
+    client = AsyncOpenAI(**kwargs)
 
     response = await client.chat.completions.create(
-        model="gpt-4o",
+        model=LLM_MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": text}
@@ -88,11 +97,11 @@ def _parse_json_response(raw: str, workspace: Optional[str]) -> list[ParsedTask]
     data = json.loads(raw)
     tasks = []
     for item in data:
-        agent_str = item.get("agent", "claude").lower()
+        agent_str = item.get("agent", "qwen").lower()
         try:
             agent_type = AgentType(agent_str)
         except ValueError:
-            agent_type = AgentType.CLAUDE
+            agent_type = AgentType.QWEN
         tasks.append(ParsedTask(
             agent=agent_type,
             task=item.get("task", ""),
@@ -136,12 +145,16 @@ def _detect_agent(text_lower: str) -> AgentType:
     claude_kw = ["claude", "claude code", "重构", "单元测试", "测试", "文档",
                  "readme", "注释", "优化", "分析", "review", "后端", "api",
                  "接口", "数据库", "登录", "认证", "实现"]
+    qwen_kw   = ["qwen", "千问", "通义", "通义千问", "阿里", "qwen-", "灵积"]
 
     cursor_score = sum(1 for kw in cursor_kw if kw in text_lower)
     codex_score  = sum(1 for kw in codex_kw  if kw in text_lower)
     claude_score = sum(1 for kw in claude_kw if kw in text_lower)
+    qwen_score   = sum(1 for kw in qwen_kw   if kw in text_lower)
 
     # Explicit agent name always wins
+    if any(kw in text_lower for kw in ["千问", "通义", "qwen"]):
+        return AgentType.QWEN
     if "cursor" in text_lower:
         return AgentType.CURSOR
     if "codex" in text_lower:
@@ -150,5 +163,10 @@ def _detect_agent(text_lower: str) -> AgentType:
         return AgentType.CLAUDE
 
     # Otherwise pick highest score
-    scores = {AgentType.CURSOR: cursor_score, AgentType.CODEX: codex_score, AgentType.CLAUDE: claude_score}
+    scores = {
+        AgentType.CURSOR: cursor_score,
+        AgentType.CODEX:  codex_score,
+        AgentType.CLAUDE: claude_score,
+        AgentType.QWEN:   qwen_score,
+    }
     return max(scores, key=lambda k: scores[k]) if max(scores.values()) > 0 else AgentType.CLAUDE

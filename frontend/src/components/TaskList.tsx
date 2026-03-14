@@ -6,6 +6,7 @@ const AGENT_COLOR: Record<AgentType, string> = {
   cursor: 'text-[#4f9eff]',
   claude: 'text-[#a855f7]',
   codex:  'text-[#22d3a0]',
+  qwen:   'text-[#f59e0b]',
 }
 
 const STATUS_BADGE: Record<TaskStatus, string> = {
@@ -67,7 +68,7 @@ export function TaskList({ tasks, selectedId, onSelect, onStop, onRetry, onDelet
           ))}
         </div>
         <div className="flex gap-1">
-          {(['all', 'cursor', 'claude', 'codex'] as const).map(a => (
+          {(['all', 'cursor', 'claude', 'codex', 'qwen'] as const).map(a => (
             <button
               key={a}
               onClick={() => setAgentFilter(a)}

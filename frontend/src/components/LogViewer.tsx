@@ -6,6 +6,7 @@ const AGENT_COLORS: Record<AgentType, string> = {
   cursor: '#4f9eff',
   claude: '#a855f7',
   codex:  '#22d3a0',
+  qwen:   '#f59e0b',
 }
 
 interface Props {
