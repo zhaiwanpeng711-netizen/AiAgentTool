@@ -1,0 +1,92 @@
+import asyncio
+import logging
+import os
+import shutil
+from typing import Optional
+
+from backend.agents.base_agent import BaseAgent, LogCallback
+from backend.config import CLAUDE_CLI_PATH, WORKSPACE_DIR, ANTHROPIC_API_KEY, OPENAI_API_KEY
+from backend.scheduler.models import AgentType, Task
+
+logger = logging.getLogger(__name__)
+
+
+class ClaudeAgent(BaseAgent):
+    """Adapter for Claude Code CLI (claude)."""
+
+    def __init__(self):
+        self._processes: dict[str, asyncio.subprocess.Process] = {}
+
+    @property
+    def agent_type(self) -> str:
+        return AgentType.CLAUDE
+
+    async def run(self, task: Task, on_log: LogCallback) -> int:
+        workspace = task.workspace or WORKSPACE_DIR
+        os.makedirs(workspace, exist_ok=True)
+
+        await on_log(f"Working directory: {workspace}", "system")
+        await on_log(f"Invoking: {CLAUDE_CLI_PATH}", "system")
+
+        cmd = [
+            CLAUDE_CLI_PATH,
+            "--print",          # non-interactive, print output
+            "--dangerously-skip-permissions",  # skip confirmation prompts
+            task.description,
+        ]
+
+        # Build environment — explicitly inject API keys
+        env = {**os.environ}
+        if ANTHROPIC_API_KEY:
+            env["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
+        if OPENAI_API_KEY:
+            env["OPENAI_API_KEY"] = OPENAI_API_KEY
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=workspace,
+                env=env,
+            )
+            self._processes[task.id] = proc
+
+            async def stream_reader(stream, level: str):
+                while True:
+                    line = await stream.readline()
+                    if not line:
+                        break
+                    text = line.decode("utf-8", errors="replace").rstrip()
+                    if text:
+                        await on_log(text, level)
+
+            await asyncio.gather(
+                stream_reader(proc.stdout, "info"),
+                stream_reader(proc.stderr, "error"),
+            )
+
+            await proc.wait()
+            return proc.returncode or 0
+
+        except FileNotFoundError:
+            await on_log(
+                f"Claude CLI not found at '{CLAUDE_CLI_PATH}'. "
+                "Install it with: npm install -g @anthropic-ai/claude-code",
+                "error"
+            )
+            return 1
+        finally:
+            self._processes.pop(task.id, None)
+
+    async def stop(self, task_id: str):
+        proc = self._processes.get(task_id)
+        if proc:
+            try:
+                proc.terminate()
+                await asyncio.sleep(0.5)
+                if proc.returncode is None:
+                    proc.kill()
+            except ProcessLookupError:
+                pass
+            self._processes.pop(task_id, None)
