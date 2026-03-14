@@ -29,9 +29,11 @@ CODEX_CLI_PATH = os.getenv("CODEX_CLI_PATH", "codex")
 # Codex model
 CODEX_MODEL = os.getenv("CODEX_MODEL", "gpt-5.2-codex")
 
-# Claude Code CLI model — leave empty to let Claude CLI auto-select
-# Bailian Anthropic proxy supports: claude-3-5-sonnet-20241022 / claude-3-5-haiku-20241022
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
+# Claude Code CLI model
+# - 使用百炼 Anthropic 代理时：必须填千问模型名（如 qwen3-coder-plus），百炼不支持原生 Claude 模型
+# - 使用官方 api.anthropic.com 时：可填 claude-3-5-sonnet-20241022，或留空让 CLI 自选
+_bailian = "dashscope" in (os.getenv("ANTHROPIC_BASE_URL") or "").lower() or "aliyuncs" in (os.getenv("ANTHROPIC_BASE_URL") or "").lower()
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "qwen3-coder-plus" if _bailian else "claude-3-5-sonnet-20241022")
 
 # Codex multi-account profile support
 # CODEX_DEFAULT_PROFILE: which profile to use by default ("personal" or "business")
@@ -53,3 +55,8 @@ QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compa
 
 # Log retention (max log lines per task)
 MAX_LOG_LINES = int(os.getenv("MAX_LOG_LINES", "1000"))
+
+# JWT Configuration
+SECRET_KEY = os.getenv("SECRET_KEY", "09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7")
+ALGORITHM = os.getenv("ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))

@@ -17,6 +17,7 @@ const AGENT_ICONS: Record<AgentType, string> = {
 }
 
 const EXAMPLE_PROMPTS = [
+  '用通义千问生成一个简洁的 README.md，包含项目简介、安装步骤和使用说明',
   '用Claude Code实现一个REST API登录接口，同时用Codex生成对应的单元测试',
   '用Cursor打开项目并重构数据库层，用Claude Code更新相关文档',
   '用Codex生成一个排序算法库，用Claude Code写详细注释和README',
@@ -93,7 +94,7 @@ export function TaskCreator({ onSubmit, onPreview }: Props) {
           value={input}
           onChange={e => handleInputChange(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="输入自然语言指令，例如：用Claude Code实现登录功能，同时用Cursor优化UI界面..."
+          placeholder="输入自然语言指令，例如：用通义千问写 README；用Claude Code实现登录；用Cursor优化UI..."
           rows={3}
           className="w-full bg-transparent px-4 pt-4 pb-2 text-sm text-slate-200 placeholder-slate-600 resize-none outline-none"
         />

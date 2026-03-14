@@ -55,6 +55,7 @@ class ClaudeAgent(BaseAgent):
         ]
         if CLAUDE_MODEL:
             cmd += ["--model", CLAUDE_MODEL]
+            await on_log(f"Model: {CLAUDE_MODEL}", "system")
         cmd.append(task.description)
 
         # Build environment — inject API keys and optional base URLs
